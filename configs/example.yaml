@@ -1,0 +1,252 @@
+# =========================================================================================
+# TLS-Client Engine v3.5+ 完全体配置文件
+# =========================================================================================
+# 本配置文件展示了所有可用的配置选项
+# 所有硬伤和遗漏已修复，配置项与代码完全对应
+
+# =========================================================================================
+# 全局配置 (global): 程序的"大脑中枢"
+# =========================================================================================
+global:
+  log_level: "debug"
+  # 可选值: "debug", "info", "warn", "error"
+  #   "debug":  最详细，打印 TLS 握手细节、H2 协议帧、Xlink 头内容、时序等待等
+  #   "info":   默认推荐，打印核心操作
+  #   "warn":   只打印警告
+  #   "error":  只打印严重错误
+
+  log_output: "stderr"
+  # 可选值:
+  #   "stderr": 默认，输出到控制台错误流
+  #   "stdout": 输出到控制台标准流
+  #   "file:/path/to/log.txt": 输出到文件
+
+  metrics:
+    enabled: true
+    endpoint: "127.0.0.1:9091"
+
+# =========================================================================================
+# 入站配置 (inbound): 流量的"捕获入口"
+# =========================================================================================
+inbound:
+  socks5:
+    listen: "127.0.0.1:1080"
+    # "127.0.0.1:1080": 只允许本机连接
+    # "0.0.0.0:1080": 允许局域网连接
+    username: ""  # 留空则无认证
+    password: ""
+
+  http:
+    listen: "127.0.0.1:8080"
+
+# =========================================================================================
+# 指纹配置 (fingerprint): 引擎的"人格面具"
+# =========================================================================================
+fingerprint:
+  rotation:
+    mode: "fixed"
+    # 可选值:
+    #   "fixed":     始终使用 profile 字段指定的指纹
+    #   "random":    每次连接随机选择
+    #   "per-domain": 同一域名使用同一指纹
+    #   "weighted":  按权重随机选择
+    #   "timed":     按时间间隔轮换
+
+    profile: "chrome-126-win"
+    # 默认指纹 (mode=fixed 时使用)
+
+    profiles:
+      # 完整指纹库列表
+      # --- Chrome 系列 ---
+      - "chrome-126-win"
+      - "chrome-126-mac"
+      - "chrome-126-android"
+      - "chrome-125-win"
+      - "chrome-124-win"
+      - "chrome-124-mac"
+      - "chrome-123-win"
+      - "chrome-120-win"
+      # --- Edge 系列 ---
+      - "edge-126-win"
+      - "edge-126-mac"
+      - "edge-124-win"
+      # --- Firefox 系列 ---
+      - "firefox-127-win"
+      - "firefox-127-mac"
+      - "firefox-126-linux"
+      - "firefox-124-win"
+      - "firefox-121-win"
+      # --- Safari 系列 ---
+      - "safari-175-mac"
+      - "safari-175-ios"
+      - "safari-17-mac"
+      - "safari-17-ios"
+
+    interval: "1h"  # mode=timed 时的轮换间隔
+    weights: []     # mode=weighted 时的权重列表
+
+# =========================================================================================
+# TLS 验证配置 (tls): 引擎的"信任标准"
+# =========================================================================================
+tls:
+  verify_mode: "sni-skip"
+  # 可选值:
+  #   "strict":   严格验证证书和域名
+  #   "sni-skip": 只验证证书链，不验证域名 (域前置必需)
+  #   "insecure": 完全不验证 (仅测试用)
+  #   "pin":      证书公钥绑定
+
+  verify_opts:
+    cert_pin: ""    # mode=pin 时的证书哈希
+    custom_ca: ""   # 自定义 CA 证书路径
+
+# =========================================================================================
+# 节点配置 (nodes): 引擎的"发射阵地"
+# =========================================================================================
+nodes:
+  # -----------------------------------------------------------------
+  # 【剧本一】Xlink 借力 + 边缘智能路由 (推荐)
+  # -----------------------------------------------------------------
+  - name: "cf-worker-xlink"
+    address: "172.67.170.151:443"  # CF 优选IP
+    sni: "your-worker.workers.dev"  # Worker 域名
+    
+    transport: "ws"
+    # 可选值:
+    #   "ws":        WebSocket 隧道 (推荐)
+    #   "h2":        HTTP/2 隧道 (等效于 ws)
+    #   "raw":       裸 TLS 连接
+    #   "socks5-out": 本地 SOCKS5 出站 (【已修复硬伤1】)
+
+    transport_opts:
+      ws_path: "/?token=my-secret-key-888"
+      ws_host: "your-worker.workers.dev"
+      ws_headers:
+        X-Client-Location: "US"
+        X-Custom-Header: "MyValue"
+      # socks5-out 模式专用配置
+      # socks5_addr: "127.0.0.1:9050"
+      # socks5_username: ""
+      # socks5_password: ""
+
+    # Xlink 借力配置
+    remote_proxy:
+      socks5: ""   # Worker 使用的 SOCKS5 代理 (user:pass@host:port)
+      fallback: "" # Worker 直连失败时的备用地址 (host:port)
+
+    # 【已修复硬伤3】重试配置 - jitter 现在可配置
+    retry:
+      max_attempts: 3
+      base_delay: "500ms"
+      max_delay: "5s"
+      jitter: 0.3  # 【新增】抖动系数 0.0-1.0
+
+    # 【已修复遗漏1】连接池配置 - 现在会被实际读取
+    pool:
+      max_idle: 10       # 最大空闲连接数
+      max_per_key: 5     # 每个 key 的最大连接数
+      idle_timeout: "120s"  # 空闲超时
+      max_lifetime: "10m"   # 最大生命周期
+
+    active: true
+
+  # -----------------------------------------------------------------
+  # 【剧本二】本地多级代理链 (【已修复硬伤1】)
+  # -----------------------------------------------------------------
+  - name: "local-chain-via-tor"
+    address: "172.67.170.151:443"
+    sni: "your-worker.workers.dev"
+    
+    transport: "socks5-out"  # 【现在可用！】
+    
+    transport_opts:
+      socks5_addr: "127.0.0.1:9050"  # 本地 Tor 代理
+      socks5_username: ""
+      socks5_password: ""
+
+    active: false
+
+# =========================================================================================
+# 【已修复硬伤2】客户端行为配置 (client_behavior)
+# 时序控制、Cookie 管理等 - 现在会被实际读取和应用
+# =========================================================================================
+client_behavior:
+  cadence:
+    mode: "none"
+    # 可选值:
+    #   "none":       无延迟
+    #   "browsing":   模拟浏览行为 (1-5秒随机延迟)
+    #   "fast":       快速模式 (100-500毫秒)
+    #   "aggressive": 激进模式 (0-100毫秒)
+    #   "random":     完全随机 (0-10秒)
+    #   "custom":     自定义范围
+    #   "sequence":   按序列延迟
+    
+    min_delay: "100ms"  # custom 模式的最小延迟
+    max_delay: "1s"     # custom 模式的最大延迟
+    sequence:           # sequence 模式的延迟列表
+      - "500ms"
+      - "1s"
+      - "200ms"
+    jitter: 0.3         # 抖动系数
+
+  cookies:
+    enabled: false
+    clear_on_rotation: false  # 指纹轮换时是否清除 Cookie
+
+  follow_redirects: true
+  max_redirects: 10
+
+# =========================================================================================
+# 【已修复遗漏2】API 服务器配置
+# 管理 API - 现在会被实际启动
+# =========================================================================================
+api:
+  enabled: false
+  listen: "127.0.0.1:9090"
+  token: ""  # Bearer Token 认证，留空则无认证
+
+# =========================================================================================
+# 【已修复遗漏2】健康检查配置
+# 节点健康监控 - 现在会被实际启动
+# =========================================================================================
+health:
+  enabled: false
+  interval: "5m"      # 检查间隔
+  timeout: "10s"      # 单次检查超时
+  threshold: 3        # 连续失败多少次标记为 down
+  degraded_ms: 500    # 延迟超过多少毫秒标记为 degraded
+  test_url: "http://www.gstatic.com/generate_204"
+
+# =========================================================================================
+# 【已修复遗漏3】ProxyIP 池配置
+# 动态 IP 轮换 - 现在会被实际启动和使用
+# =========================================================================================
+proxy_ips:
+  enabled: false
+  mode: "latency"
+  # 可选值:
+  #   "round-robin": 轮询
+  #   "random":      随机
+  #   "latency":     最低延迟优先
+  #   "weighted":    按权重
+  #   "failover":    故障转移
+
+  options:
+    check_period: "5m"  # 健康检查周期
+    timeout: "10s"      # 连接超时
+    max_fails: 3        # 最大失败次数
+
+  entries:
+    - address: "172.67.170.151:443"
+      sni: "your-worker.workers.dev"
+      weight: 10
+      region: "US"
+      provider: "cloudflare"
+      enabled: true
+    # - address: "104.18.23.23:443"
+    #   sni: "your-jp-worker.workers.dev"
+    #   weight: 5
+    #   region: "JP"
+    #   provider: "cloudflare"
+    #   enabled: true

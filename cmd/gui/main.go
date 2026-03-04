@@ -2,22 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
 
 	"github.com/user/tls-client/pkg/engine"
 	"github.com/user/tls-client/pkg/fingerprint"
@@ -27,651 +23,1569 @@ import (
 	"github.com/user/tls-client/pkg/verify"
 )
 
-// ========================================
-// 全局状态
-// ========================================
-
-type AppState struct {
-	// 玩法A状态
-	proxyRunning   atomic.Bool
-	socks5Server   *inbound.SOCKS5Server
-	httpServer     *inbound.HTTPProxyServer
-	tunnelManager  *outbound.TunnelManager
-	proxyStopCh    chan struct{}
-
-	// 统计
-	totalConns     atomic.Int64
-	totalBytes     atomic.Int64
-	activeConns    atomic.Int64
-
-	// 日志
-	logBuffer      []string
-	logMutex       sync.Mutex
-	maxLogLines    int
-}
-
-var state = &AppState{
-	maxLogLines: 500,
-}
-
-func (s *AppState) addLog(msg string) {
-	s.logMutex.Lock()
-	defer s.logMutex.Unlock()
-	timestamp := time.Now().Format("15:04:05")
-	s.logBuffer = append(s.logBuffer, fmt.Sprintf("[%s] %s", timestamp, msg))
-	if len(s.logBuffer) > s.maxLogLines {
-		s.logBuffer = s.logBuffer[len(s.logBuffer)-s.maxLogLines:]
-	}
-}
-
-func (s *AppState) getLogs() string {
-	s.logMutex.Lock()
-	defer s.logMutex.Unlock()
-	return strings.Join(s.logBuffer, "\n")
-}
-
-// ========================================
-// 主程序入口
-// ========================================
+// =====================================================
+// TLS-Client Web GUI v3.5 - 玩法A+B 融合客户端
+// 纯 Go 实现，无 CGO 依赖，跨平台编译
+// =====================================================
 
 func main() {
-	a := app.New()
-	a.Settings().SetTheme(theme.DarkTheme())
+	fmt.Println("╔════════════════════════════════════════════════════════════╗")
+	fmt.Println("║       TLS-Client GUI v3.5 - Anti-Fingerprint Engine        ║")
+	fmt.Println("║              玩法A + 玩法B 融合客户端                       ║")
+	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 
-	w := a.NewWindow("TLS-Client GUI v3.5")
-	w.Resize(fyne.NewSize(900, 700))
+	gui := NewWebGUI()
 
-	// 创建标签页
-	tabs := container.NewAppTabs(
-		container.NewTabItem("🚀 玩法A: 隧道代理", createPlayATab(w)),
-		container.NewTabItem("🔬 玩法B: 引擎直连", createPlayBTab(w)),
-		container.NewTabItem("🎭 指纹管理", createFingerprintTab()),
-		container.NewTabItem("📊 状态监控", createStatusTab(w)),
-		container.NewTabItem("📝 日志", createLogTab(w)),
-	)
-	tabs.SetTabLocation(container.TabLocationTop)
+	// 启动Web服务器
+	port := gui.FindAvailablePort(8899)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
-	w.SetContent(tabs)
-	w.ShowAndRun()
-}
+	fmt.Printf("\n🚀 启动Web GUI: http://%s\n", addr)
+	fmt.Println("📌 请在浏览器中打开上述地址")
+	fmt.Println("📌 按 Ctrl+C 退出程序\n")
 
-// ========================================
-// 玩法A: 隧道代理模式
-// ========================================
-
-func createPlayATab(w fyne.Window) fyne.CanvasObject {
-	// === 服务配置区 ===
-	socks5AddrEntry := widget.NewEntry()
-	socks5AddrEntry.SetText("127.0.0.1:1080")
-	socks5AddrEntry.SetPlaceHolder("SOCKS5监听地址")
-
-	httpAddrEntry := widget.NewEntry()
-	httpAddrEntry.SetText("127.0.0.1:8080")
-	httpAddrEntry.SetPlaceHolder("HTTP代理监听地址")
-
-	// === 节点配置区 ===
-	nodeAddrEntry := widget.NewEntry()
-	nodeAddrEntry.SetText("172.67.170.151:443")
-	nodeAddrEntry.SetPlaceHolder("CF优选IP或目标地址")
-
-	sniEntry := widget.NewEntry()
-	sniEntry.SetText("your-worker.workers.dev")
-	sniEntry.SetPlaceHolder("SNI域名")
-
-	wsPathEntry := widget.NewEntry()
-	wsPathEntry.SetText("/?token=secret")
-	wsPathEntry.SetPlaceHolder("WebSocket路径")
-
-	// === 传输协议选择 ===
-	transportSelect := widget.NewSelect([]string{"ws", "h2", "raw"}, nil)
-	transportSelect.SetSelected("ws")
-
-	// === 指纹选择 ===
-	profileSelect := widget.NewSelect(fingerprint.List(), nil)
-	profileSelect.SetSelected("chrome-126-win")
-
-	// === Xlink借力配置 ===
-	socks5ProxyEntry := widget.NewEntry()
-	socks5ProxyEntry.SetPlaceHolder("user:pass@host:port (可选)")
-
-	fallbackEntry := widget.NewEntry()
-	fallbackEntry.SetPlaceHolder("fallback-host:port (可选)")
-
-	// === 控制按钮 ===
-	startBtn := widget.NewButton("▶ 启动代理", nil)
-	startBtn.Importance = widget.HighImportance
-
-	stopBtn := widget.NewButton("■ 停止代理", nil)
-	stopBtn.Disable()
-
-	statusLabel := widget.NewLabel("状态: 已停止")
-	statusLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	// === 按钮逻辑 ===
-	startBtn.OnTapped = func() {
-		if state.proxyRunning.Load() {
-			return
-		}
-
-		// 获取配置
-		cfg := &ProxyConfig{
-			SOCKS5Addr:  socks5AddrEntry.Text,
-			HTTPAddr:    httpAddrEntry.Text,
-			NodeAddr:    nodeAddrEntry.Text,
-			SNI:         sniEntry.Text,
-			WSPath:      wsPathEntry.Text,
-			Transport:   transportSelect.Selected,
-			Profile:     profileSelect.Selected,
-			SOCKS5Proxy: socks5ProxyEntry.Text,
-			Fallback:    fallbackEntry.Text,
-		}
-
-		err := startProxy(cfg)
-		if err != nil {
-			dialog.ShowError(err, w)
-			state.addLog(fmt.Sprintf("启动失败: %v", err))
-			return
-		}
-
-		state.proxyRunning.Store(true)
-		statusLabel.SetText("状态: ✅ 运行中")
-		startBtn.Disable()
-		stopBtn.Enable()
-		state.addLog("代理服务已启动")
-	}
-
-	stopBtn.OnTapped = func() {
-		stopProxy()
-		state.proxyRunning.Store(false)
-		statusLabel.SetText("状态: ⏹ 已停止")
-		startBtn.Enable()
-		stopBtn.Disable()
-		state.addLog("代理服务已停止")
-	}
-
-	// === 布局 ===
-	form := container.NewVBox(
-		widget.NewCard("🌐 本地代理设置", "",
-			container.NewVBox(
-				container.NewGridWithColumns(2,
-					widget.NewLabel("SOCKS5地址:"),
-					socks5AddrEntry,
-					widget.NewLabel("HTTP代理地址:"),
-					httpAddrEntry,
-				),
-			),
-		),
-		widget.NewCard("🎯 远程节点配置", "",
-			container.NewVBox(
-				container.NewGridWithColumns(2,
-					widget.NewLabel("节点地址:"),
-					nodeAddrEntry,
-					widget.NewLabel("SNI:"),
-					sniEntry,
-					widget.NewLabel("WS路径:"),
-					wsPathEntry,
-					widget.NewLabel("传输协议:"),
-					transportSelect,
-					widget.NewLabel("指纹:"),
-					profileSelect,
-				),
-			),
-		),
-		widget.NewCard("🔗 Xlink借力 (可选)", "",
-			container.NewVBox(
-				container.NewGridWithColumns(2,
-					widget.NewLabel("SOCKS5代理:"),
-					socks5ProxyEntry,
-					widget.NewLabel("Fallback:"),
-					fallbackEntry,
-				),
-			),
-		),
-		widget.NewSeparator(),
-		container.NewHBox(
-			startBtn,
-			stopBtn,
-			layout.NewSpacer(),
-			statusLabel,
-		),
-	)
-
-	return container.NewVScroll(form)
-}
-
-// ========================================
-// 玩法B: 引擎直连模式
-// ========================================
-
-func createPlayBTab(w fyne.Window) fyne.CanvasObject {
-	// === 目标配置 ===
-	targetURLEntry := widget.NewEntry()
-	targetURLEntry.SetText("https://tls.peet.ws/api/all")
-	targetURLEntry.SetPlaceHolder("目标URL")
-
-	methodSelect := widget.NewSelect([]string{"GET", "POST", "HEAD"}, nil)
-	methodSelect.SetSelected("GET")
-
-	// === 指纹配置 ===
-	profileSelect := widget.NewSelect(fingerprint.List(), nil)
-	profileSelect.SetSelected("chrome-126-win")
-
-	// === 高级选项 ===
-	cadenceSelect := widget.NewSelect([]string{
-		"none", "browsing", "fast", "aggressive", "random",
-	}, nil)
-	cadenceSelect.SetSelected("browsing")
-
-	enableCookies := widget.NewCheck("启用Cookie管理", nil)
-	enableCookies.SetChecked(true)
-
-	// === 结果显示 ===
-	resultText := widget.NewMultiLineEntry()
-	resultText.SetPlaceHolder("响应结果将显示在这里...")
-	resultText.Wrapping = fyne.TextWrapWord
-	resultText.SetMinRowsVisible(15)
-
-	// === 发送按钮 ===
-	sendBtn := widget.NewButton("🚀 发送请求", nil)
-	sendBtn.Importance = widget.HighImportance
-
-	progressBar := widget.NewProgressBarInfinite()
-	progressBar.Hide()
-
-	sendBtn.OnTapped = func() {
-		targetURL := targetURLEntry.Text
-		if targetURL == "" {
-			dialog.ShowError(fmt.Errorf("请输入目标URL"), w)
-			return
-		}
-
-		sendBtn.Disable()
-		progressBar.Show()
-		resultText.SetText("正在请求...")
-		state.addLog(fmt.Sprintf("玩法B请求: %s [%s]", targetURL, profileSelect.Selected))
-
-		go func() {
-			result, err := sendDirectRequest(&DirectRequestConfig{
-				URL:        targetURL,
-				Method:     methodSelect.Selected,
-				Profile:    profileSelect.Selected,
-				Cadence:    cadenceSelect.Selected,
-				UseCookies: enableCookies.Checked,
-			})
-
-			// 更新UI必须在主线程
-			fyne.CurrentApp().Driver().CanvasForObject(resultText).Content().Refresh()
-			
-			if err != nil {
-				resultText.SetText(fmt.Sprintf("❌ 请求失败:\n%v", err))
-				state.addLog(fmt.Sprintf("请求失败: %v", err))
-			} else {
-				resultText.SetText(result)
-				state.addLog("请求成功")
-			}
-			
-			sendBtn.Enable()
-			progressBar.Hide()
-		}()
-	}
-
-	// === 布局 ===
-	form := container.NewVBox(
-		widget.NewCard("🎯 请求配置", "",
-			container.NewVBox(
-				container.NewGridWithColumns(2,
-					widget.NewLabel("目标URL:"),
-					targetURLEntry,
-					widget.NewLabel("请求方法:"),
-					methodSelect,
-					widget.NewLabel("指纹:"),
-					profileSelect,
-				),
-			),
-		),
-		widget.NewCard("⚙️ 高级选项", "",
-			container.NewVBox(
-				container.NewGridWithColumns(2,
-					widget.NewLabel("时序模式:"),
-					cadenceSelect,
-				),
-				enableCookies,
-			),
-		),
-		container.NewHBox(sendBtn, progressBar),
-		widget.NewSeparator(),
-		widget.NewCard("📄 响应结果", "", resultText),
-	)
-
-	return container.NewVScroll(form)
-}
-
-// ========================================
-// 指纹管理标签页
-// ========================================
-
-func createFingerprintTab() fyne.CanvasObject {
-	// 指纹列表
-	profiles := fingerprint.All()
-	
-	var items []fyne.CanvasObject
-	items = append(items, widget.NewLabel(fmt.Sprintf("共 %d 个指纹配置", len(profiles))))
-	items = append(items, widget.NewSeparator())
-
-	// 按浏览器分组
-	browsers := map[string][]*fingerprint.BrowserProfile{}
-	for _, p := range profiles {
-		browsers[p.Browser] = append(browsers[p.Browser], p)
-	}
-
-	for browser, profiles := range browsers {
-		browserLabel := widget.NewLabel(fmt.Sprintf("🌐 %s (%d个)", strings.ToUpper(browser), len(profiles)))
-		browserLabel.TextStyle = fyne.TextStyle{Bold: true}
-		items = append(items, browserLabel)
-
-		for _, p := range profiles {
-			tags := ""
-			if len(p.Tags) > 0 {
-				tags = fmt.Sprintf(" [%s]", strings.Join(p.Tags, ", "))
-			}
-			profileLabel := widget.NewLabel(fmt.Sprintf("  • %s (%s)%s", p.Name, p.Platform, tags))
-			items = append(items, profileLabel)
-		}
-		items = append(items, widget.NewSeparator())
-	}
-
-	return container.NewVScroll(container.NewVBox(items...))
-}
-
-// ========================================
-// 状态监控标签页
-// ========================================
-
-func createStatusTab(w fyne.Window) fyne.CanvasObject {
-	totalConnsLabel := widget.NewLabel("总连接数: 0")
-	activeConnsLabel := widget.NewLabel("活跃连接: 0")
-	totalBytesLabel := widget.NewLabel("总流量: 0 B")
-	proxyStatusLabel := widget.NewLabel("代理状态: 停止")
-
-	refreshBtn := widget.NewButton("🔄 刷新", nil)
-
-	refreshBtn.OnTapped = func() {
-		totalConnsLabel.SetText(fmt.Sprintf("总连接数: %d", state.totalConns.Load()))
-		activeConnsLabel.SetText(fmt.Sprintf("活跃连接: %d", state.activeConns.Load()))
-		totalBytesLabel.SetText(fmt.Sprintf("总流量: %s", formatBytes(state.totalBytes.Load())))
-		if state.proxyRunning.Load() {
-			proxyStatusLabel.SetText("代理状态: ✅ 运行中")
-		} else {
-			proxyStatusLabel.SetText("代理状态: ⏹ 停止")
-		}
-	}
-
-	// 自动刷新
+	// 自动打开浏览器
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if w.Canvas() != nil {
-				refreshBtn.OnTapped()
-			}
-		}
+		time.Sleep(800 * time.Millisecond)
+		openBrowser(fmt.Sprintf("http://%s", addr))
 	}()
 
-	return container.NewVBox(
-		widget.NewCard("📊 运行统计", "",
-			container.NewVBox(
-				totalConnsLabel,
-				activeConnsLabel,
-				totalBytesLabel,
-				proxyStatusLabel,
-			),
-		),
-		refreshBtn,
-	)
+	// 启动HTTP服务
+	if err := http.ListenAndServe(addr, gui); err != nil {
+		fmt.Printf("❌ 启动失败: %v\n", err)
+		os.Exit(1)
+	}
 }
 
-// ========================================
-// 日志标签页
-// ========================================
+// =====================================================
+// WebGUI 核心结构
+// =====================================================
 
-func createLogTab(w fyne.Window) fyne.CanvasObject {
-	logText := widget.NewMultiLineEntry()
-	logText.Wrapping = fyne.TextWrapWord
-	logText.SetMinRowsVisible(25)
+type WebGUI struct {
+	mu sync.Mutex
 
-	refreshBtn := widget.NewButton("🔄 刷新日志", func() {
-		logText.SetText(state.getLogs())
-	})
+	// 玩法A 状态
+	proxyRunning bool
+	socks5Server *inbound.SOCKS5Server
+	httpServer   *inbound.HTTPProxyServer
+	tunnel       *outbound.TunnelManager
+	proxyConfig  ProxyConfig
 
-	clearBtn := widget.NewButton("🗑 清空日志", func() {
-		state.logMutex.Lock()
-		state.logBuffer = []string{}
-		state.logMutex.Unlock()
-		logText.SetText("")
-	})
+	// 统计
+	stats struct {
+		TotalConns  int64
+		TotalBytes  int64
+		ActiveConns int64
+		StartTime   time.Time
+	}
 
-	// 自动刷新
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if w.Canvas() != nil {
-				logText.SetText(state.getLogs())
-			}
-		}
-	}()
-
-	return container.NewBorder(
-		container.NewHBox(refreshBtn, clearBtn),
-		nil, nil, nil,
-		container.NewVScroll(logText),
-	)
+	// 日志
+	logs     []LogEntry
+	logsLock sync.Mutex
 }
-
-// ========================================
-// 核心功能实现
-// ========================================
 
 type ProxyConfig struct {
-	SOCKS5Addr  string
-	HTTPAddr    string
-	NodeAddr    string
-	SNI         string
-	WSPath      string
-	Transport   string
-	Profile     string
-	SOCKS5Proxy string
-	Fallback    string
+	Address     string `json:"address"`
+	SNI         string `json:"sni"`
+	WSPath      string `json:"ws_path"`
+	Listen      string `json:"listen"`
+	HTTPListen  string `json:"http_listen"`
+	Profile     string `json:"profile"`
+	Transport   string `json:"transport"`
+	VerifyMode  string `json:"verify_mode"`
+	SOCKS5Proxy string `json:"socks5_proxy"`
+	Fallback    string `json:"fallback"`
 }
 
-func startProxy(cfg *ProxyConfig) error {
-	logger, err := applog.New("info")
-	if err != nil {
-		return fmt.Errorf("创建日志器失败: %w", err)
+type LogEntry struct {
+	Time    string `json:"time"`
+	Level   string `json:"level"`
+	Message string `json:"message"`
+}
+
+func NewWebGUI() *WebGUI {
+	g := &WebGUI{
+		logs: make([]LogEntry, 0, 200),
+	}
+	g.stats.StartTime = time.Now()
+	g.addLog("info", "TLS-Client GUI 已启动")
+	return g
+}
+
+// =====================================================
+// HTTP 路由
+// =====================================================
+
+func (g *WebGUI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// CORS
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	// API 路由
+	switch {
+	case r.URL.Path == "/api/fingerprints":
+		g.apiFingerprints(w, r)
+	case r.URL.Path == "/api/proxy/start":
+		g.apiProxyStart(w, r)
+	case r.URL.Path == "/api/proxy/stop":
+		g.apiProxyStop(w, r)
+	case r.URL.Path == "/api/proxy/status":
+		g.apiProxyStatus(w, r)
+	case r.URL.Path == "/api/request":
+		g.apiRequest(w, r)
+	case r.URL.Path == "/api/logs":
+		g.apiLogs(w, r)
+	case r.URL.Path == "/api/stats":
+		g.apiStats(w, r)
+	case r.URL.Path == "/api/logs/clear":
+		g.apiLogsClear(w, r)
+	case r.URL.Path == "/" || r.URL.Path == "/index.html":
+		g.serveIndex(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// =====================================================
+// API: 指纹列表
+// =====================================================
+
+func (g *WebGUI) apiFingerprints(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	profiles := fingerprint.All()
+	result := make([]map[string]interface{}, 0, len(profiles))
+
+	browsers := make(map[string]int)
+	platforms := make(map[string]int)
+
+	for _, p := range profiles {
+		result = append(result, map[string]interface{}{
+			"name":     p.Name,
+			"browser":  p.Browser,
+			"platform": p.Platform,
+			"version":  p.Version,
+			"ua":       p.UserAgent,
+			"h2fp":     p.H2Fingerprint(),
+			"ja4h":     fingerprint.ComputeJA4H(p),
+			"tags":     p.Tags,
+		})
+		browsers[p.Browser]++
+		platforms[p.Platform]++
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"profiles":  result,
+		"count":     len(result),
+		"default":   fingerprint.DefaultProfile(),
+		"browsers":  browsers,
+		"platforms": platforms,
+	})
+}
+
+// =====================================================
+// API: 玩法A - 代理控制
+// =====================================================
+
+func (g *WebGUI) apiProxyStart(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != "POST" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Method not allowed"})
+		return
+	}
+
+	var req ProxyConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.proxyRunning {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "代理已在运行"})
+		return
+	}
+
+	// 验证参数
+	if req.Address == "" || req.SNI == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "地址和SNI不能为空"})
+		return
+	}
+
+	// 默认值
+	if req.Listen == "" {
+		req.Listen = "127.0.0.1:1080"
+	}
+	if req.Profile == "" {
+		req.Profile = fingerprint.DefaultProfile()
+	}
+	if req.Transport == "" {
+		req.Transport = "ws"
+	}
+	if req.VerifyMode == "" {
+		req.VerifyMode = "sni-skip"
+	}
+	if req.WSPath == "" {
+		req.WSPath = "/"
 	}
 
 	// 获取指纹
-	profile := fingerprint.Get(cfg.Profile)
+	profile := fingerprint.Get(req.Profile)
 	if profile == nil {
 		profile = fingerprint.MustGet(fingerprint.DefaultProfile())
+		g.addLog("warn", fmt.Sprintf("指纹 %s 不存在，使用默认指纹 %s", req.Profile, profile.Name))
 	}
 
+	// 解析验证模式
+	vmode, err := verify.ParseMode(req.VerifyMode)
+	if err != nil {
+		vmode = verify.ModeSNISkip
+	}
+
+	// 创建日志
+	logger, _ := applog.New("info")
+
 	// 创建节点配置
-	nodeCfg := &outbound.NodeConfig{
+	node := &outbound.NodeConfig{
 		Name:           "gui-node",
-		Address:        cfg.NodeAddr,
-		SNI:            cfg.SNI,
+		Address:        req.Address,
+		SNI:            req.SNI,
 		Profile:        profile,
-		VerifyMode:     verify.ModeSNISkip,
-		RemoteSOCKS5:   cfg.SOCKS5Proxy,
-		RemoteFallback: cfg.Fallback,
+		VerifyMode:     vmode,
+		RemoteSOCKS5:   req.SOCKS5Proxy,
+		RemoteFallback: req.Fallback,
 	}
 
 	// 创建隧道管理器
-	state.tunnelManager = outbound.NewTunnelManager(nodeCfg, logger)
+	g.tunnel = outbound.NewTunnelManager(node, logger)
 
 	// 连接处理函数
 	onConnect := func(clientConn net.Conn, target, domain string) {
-		state.totalConns.Add(1)
-		state.activeConns.Add(1)
-		defer state.activeConns.Add(-1)
-		state.addLog(fmt.Sprintf("新连接: %s -> %s", domain, target))
-		state.tunnelManager.HandleConnect(clientConn, target, domain)
+		atomic.AddInt64(&g.stats.TotalConns, 1)
+		atomic.AddInt64(&g.stats.ActiveConns, 1)
+		defer atomic.AddInt64(&g.stats.ActiveConns, -1)
+
+		g.addLog("info", fmt.Sprintf("🔗 连接: %s → %s", domain, target))
+		g.tunnel.HandleConnect(clientConn, target, domain)
 	}
 
 	// 启动SOCKS5服务器
-	if cfg.SOCKS5Addr != "" {
-		state.socks5Server = inbound.NewSOCKS5Server(cfg.SOCKS5Addr, logger, onConnect)
-		if err := state.socks5Server.Start(); err != nil {
-			return fmt.Errorf("启动SOCKS5失败: %w", err)
+	g.socks5Server = inbound.NewSOCKS5Server(req.Listen, logger, onConnect)
+	if err := g.socks5Server.Start(); err != nil {
+		g.addLog("error", fmt.Sprintf("启动SOCKS5失败: %v", err))
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": fmt.Sprintf("启动SOCKS5失败: %v", err)})
+		return
+	}
+
+	// 启动HTTP代理 (可选)
+	if req.HTTPListen != "" {
+		g.httpServer = inbound.NewHTTPProxyServer(req.HTTPListen, logger, onConnect)
+		if err := g.httpServer.Start(); err != nil {
+			g.socks5Server.Stop()
+			g.addLog("error", fmt.Sprintf("启动HTTP代理失败: %v", err))
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": fmt.Sprintf("启动HTTP代理失败: %v", err)})
+			return
 		}
-		state.addLog(fmt.Sprintf("SOCKS5监听: %s", cfg.SOCKS5Addr))
 	}
 
-	// 启动HTTP代理服务器
-	if cfg.HTTPAddr != "" {
-		state.httpServer = inbound.NewHTTPProxyServer(cfg.HTTPAddr, logger, onConnect)
-		if err := state.httpServer.Start(); err != nil {
-			return fmt.Errorf("启动HTTP代理失败: %w", err)
-		}
-		state.addLog(fmt.Sprintf("HTTP代理监听: %s", cfg.HTTPAddr))
+	g.proxyRunning = true
+	g.proxyConfig = req
+	g.stats.StartTime = time.Now()
+
+	g.addLog("info", fmt.Sprintf("✅ 代理已启动"))
+	g.addLog("info", fmt.Sprintf("   SOCKS5: %s", req.Listen))
+	if req.HTTPListen != "" {
+		g.addLog("info", fmt.Sprintf("   HTTP: %s", req.HTTPListen))
+	}
+	g.addLog("info", fmt.Sprintf("   目标: %s (SNI: %s)", req.Address, req.SNI))
+	g.addLog("info", fmt.Sprintf("   指纹: %s (%s/%s)", profile.Name, profile.Browser, profile.Platform))
+	g.addLog("info", fmt.Sprintf("   传输: %s", req.Transport))
+	if req.SOCKS5Proxy != "" {
+		g.addLog("info", fmt.Sprintf("   Xlink SOCKS5: %s", req.SOCKS5Proxy))
+	}
+	if req.Fallback != "" {
+		g.addLog("info", fmt.Sprintf("   Xlink Fallback: %s", req.Fallback))
 	}
 
-	state.proxyStopCh = make(chan struct{})
-	return nil
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "代理启动成功",
+		"config":  req,
+		"profile": map[string]string{
+			"name":     profile.Name,
+			"browser":  profile.Browser,
+			"platform": profile.Platform,
+		},
+	})
 }
 
-func stopProxy() {
-	if state.proxyStopCh != nil {
-		close(state.proxyStopCh)
+func (g *WebGUI) apiProxyStop(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if !g.proxyRunning {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "代理未运行"})
+		return
 	}
-	if state.socks5Server != nil {
-		state.socks5Server.Stop()
-		state.socks5Server = nil
+
+	if g.socks5Server != nil {
+		g.socks5Server.Stop()
+		g.socks5Server = nil
 	}
-	if state.httpServer != nil {
-		state.httpServer.Stop()
-		state.httpServer = nil
+	if g.httpServer != nil {
+		g.httpServer.Stop()
+		g.httpServer = nil
 	}
-	if state.tunnelManager != nil {
-		state.tunnelManager.Close()
-		state.tunnelManager = nil
+	if g.tunnel != nil {
+		g.tunnel.Close()
+		g.tunnel = nil
 	}
+
+	g.proxyRunning = false
+	g.addLog("info", "⏹ 代理已停止")
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "代理已停止",
+	})
 }
 
-// ========================================
-// 玩法B: 直接请求
-// ========================================
+func (g *WebGUI) apiProxyStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 
-type DirectRequestConfig struct {
-	URL        string
-	Method     string
-	Profile    string
-	Cadence    string
-	UseCookies bool
+	g.mu.Lock()
+	running := g.proxyRunning
+	config := g.proxyConfig
+	g.mu.Unlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"running": running,
+		"config":  config,
+	})
 }
 
-func sendDirectRequest(cfg *DirectRequestConfig) (string, error) {
-	profile := fingerprint.Get(cfg.Profile)
+// =====================================================
+// API: 玩法B - 直接请求
+// =====================================================
+
+type DirectRequest struct {
+	URL       string            `json:"url"`
+	Method    string            `json:"method"`
+	Profile   string            `json:"profile"`
+	Cadence   string            `json:"cadence"`
+	Headers   map[string]string `json:"headers"`
+	Body      string            `json:"body"`
+	Timeout   int               `json:"timeout"`
+	FollowRed bool              `json:"follow_redirects"`
+}
+
+func (g *WebGUI) apiRequest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != "POST" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Method not allowed"})
+		return
+	}
+
+	var req DirectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	// 默认值
+	if req.Method == "" {
+		req.Method = "GET"
+	}
+	if req.Profile == "" {
+		req.Profile = fingerprint.DefaultProfile()
+	}
+	if req.Timeout <= 0 {
+		req.Timeout = 30
+	}
+
+	// 验证URL
+	if req.URL == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "URL不能为空"})
+		return
+	}
+	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
+		req.URL = "https://" + req.URL
+	}
+
+	// 获取指纹
+	profile := fingerprint.Get(req.Profile)
 	if profile == nil {
-		return "", fmt.Errorf("未知指纹: %s", cfg.Profile)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": fmt.Sprintf("指纹 %s 不存在", req.Profile)})
+		return
 	}
 
+	g.addLog("info", fmt.Sprintf("🔬 玩法B请求: %s %s", req.Method, req.URL))
+	g.addLog("info", fmt.Sprintf("   指纹: %s (%s/%s)", profile.Name, profile.Browser, profile.Platform))
+	if req.Cadence != "" && req.Cadence != "none" {
+		g.addLog("info", fmt.Sprintf("   时序: %s", req.Cadence))
+	}
+
+	// 创建选择器
 	selector := &fingerprint.FixedSelector{Profile: profile}
+
+	// 创建反检测传输层
 	transport := engine.NewFingerprintTransport(selector)
 	transport.VerifyMode = verify.ModeInsecure
 
-	// 设置时序控制
-	if cfg.Cadence != "none" {
-		var cadenceCfg engine.CadenceConfig
-		switch cfg.Cadence {
-		case "browsing":
-			cadenceCfg = engine.DefaultBrowsingCadence()
-		case "fast":
-			cadenceCfg = engine.DefaultFastCadence()
-		default:
-			cadenceCfg = engine.NoCadence()
-		}
-		transport.Cadence = engine.NewCadence(cadenceCfg)
+	// 设置时序
+	switch req.Cadence {
+	case "browsing":
+		transport.Cadence = engine.NewCadence(engine.DefaultBrowsingCadence())
+	case "fast":
+		transport.Cadence = engine.NewCadence(engine.DefaultFastCadence())
 	}
 
-	// 设置Cookie管理
-	if cfg.UseCookies {
-		cm := engine.NewCookieManagerSimple()
-		transport.CookieManager = cm
-	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
-	}
 	defer transport.CloseIdleConnections()
 
-	req, err := http.NewRequestWithContext(context.Background(), cfg.Method, cfg.URL, nil)
-	if err != nil {
-		return "", fmt.Errorf("创建请求失败: %w", err)
+	// 创建HTTP客户端
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Duration(req.Timeout) * time.Second,
+	}
+	if !req.FollowRed {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
 	}
 
-	req.Header.Set("User-Agent", profile.UserAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	// 创建请求
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.Timeout)*time.Second)
+	defer cancel()
 
-	startTime := time.Now()
-	resp, err := client.Do(req)
-	elapsed := time.Since(startTime)
+	var bodyReader io.Reader
+	if req.Body != "" {
+		bodyReader = strings.NewReader(req.Body)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bodyReader)
+	if err != nil {
+		g.addLog("error", fmt.Sprintf("创建请求失败: %v", err))
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	// 设置默认头
+	httpReq.Header.Set("User-Agent", profile.UserAgent)
+	httpReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+	httpReq.Header.Set("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7")
+	httpReq.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	httpReq.Header.Set("Connection", "keep-alive")
+	httpReq.Header.Set("Upgrade-Insecure-Requests", "1")
+
+	// 设置自定义头
+	for k, v := range req.Headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	// 发送请求
+	start := time.Now()
+	resp, err := client.Do(httpReq)
+	elapsed := time.Since(start)
 
 	if err != nil {
-		return "", fmt.Errorf("请求失败: %w", err)
+		g.addLog("error", fmt.Sprintf("❌ 请求失败: %v", err))
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error(), "elapsed_ms": elapsed.Milliseconds()})
+		return
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("读取响应失败: %w", err)
-	}
+	// 读取响应
+	body, _ := io.ReadAll(resp.Body)
 
-	result := fmt.Sprintf("=== 请求信息 ===\n")
-	result += fmt.Sprintf("URL: %s\n", cfg.URL)
-	result += fmt.Sprintf("方法: %s\n", cfg.Method)
-	result += fmt.Sprintf("指纹: %s\n", cfg.Profile)
-	result += fmt.Sprintf("耗时: %v\n", elapsed)
-	result += fmt.Sprintf("\n=== 响应信息 ===\n")
-	result += fmt.Sprintf("状态: %s\n", resp.Status)
-	result += fmt.Sprintf("协议: %s\n", resp.Proto)
-	result += fmt.Sprintf("\n=== 响应头 ===\n")
+	// 收集响应头
+	headers := make(map[string]string)
 	for k, v := range resp.Header {
-		result += fmt.Sprintf("%s: %s\n", k, strings.Join(v, ", "))
+		headers[k] = strings.Join(v, ", ")
 	}
-	result += fmt.Sprintf("\n=== 响应体 (%d 字节) ===\n", len(body))
-	
-	// 限制显示长度
-	bodyStr := string(body)
-	if len(bodyStr) > 5000 {
-		bodyStr = bodyStr[:5000] + "\n... (截断)"
-	}
-	result += bodyStr
 
-	return result, nil
+	// 截断body用于日志
+	bodyPreview := string(body)
+	if len(bodyPreview) > 200 {
+		bodyPreview = bodyPreview[:200] + "..."
+	}
+
+	g.addLog("info", fmt.Sprintf("✅ 响应: %d %s (耗时: %dms, 大小: %d bytes)",
+		resp.StatusCode, http.StatusText(resp.StatusCode), elapsed.Milliseconds(), len(body)))
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":      true,
+		"status_code":  resp.StatusCode,
+		"status":       resp.Status,
+		"headers":      headers,
+		"body":         string(body),
+		"body_size":    len(body),
+		"elapsed_ms":   elapsed.Milliseconds(),
+		"profile":      req.Profile,
+		"profile_info": map[string]string{"browser": profile.Browser, "platform": profile.Platform},
+	})
 }
 
-// ========================================
-// 辅助函数
-// ========================================
+// =====================================================
+// API: 日志和统计
+// =====================================================
 
-func formatBytes(bytes int64) string {
-	const (
-		KB = 1024
-		MB = KB * 1024
-		GB = MB * 1024
-	)
-	switch {
-	case bytes >= GB:
-		return fmt.Sprintf("%.2f GB", float64(bytes)/GB)
-	case bytes >= MB:
-		return fmt.Sprintf("%.2f MB", float64(bytes)/MB)
-	case bytes >= KB:
-		return fmt.Sprintf("%.2f KB", float64(bytes)/KB)
-	default:
-		return fmt.Sprintf("%d B", bytes)
+func (g *WebGUI) apiLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	g.logsLock.Lock()
+	logs := make([]LogEntry, len(g.logs))
+	copy(logs, g.logs)
+	g.logsLock.Unlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"logs":    logs,
+		"count":   len(logs),
+	})
+}
+
+func (g *WebGUI) apiLogsClear(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	g.logsLock.Lock()
+	g.logs = make([]LogEntry, 0, 200)
+	g.logsLock.Unlock()
+
+	g.addLog("info", "日志已清空")
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "日志已清空",
+	})
+}
+
+func (g *WebGUI) apiStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	g.mu.Lock()
+	running := g.proxyRunning
+	g.mu.Unlock()
+
+	uptime := time.Since(g.stats.StartTime)
+
+	// 浏览器和平台统计
+	profiles := fingerprint.All()
+	browsers := make(map[string]int)
+	platforms := make(map[string]int)
+	for _, p := range profiles {
+		browsers[p.Browser]++
+		platforms[p.Platform]++
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":           true,
+		"running":           running,
+		"total_conns":       atomic.LoadInt64(&g.stats.TotalConns),
+		"active_conns":      atomic.LoadInt64(&g.stats.ActiveConns),
+		"total_bytes":       atomic.LoadInt64(&g.stats.TotalBytes),
+		"uptime":            uptime.String(),
+		"uptime_secs":       int(uptime.Seconds()),
+		"fingerprint_count": len(profiles),
+		"browsers":          browsers,
+		"platforms":         platforms,
+		"default_profile":   fingerprint.DefaultProfile(),
+	})
+}
+
+func (g *WebGUI) addLog(level, message string) {
+	entry := LogEntry{
+		Time:    time.Now().Format("15:04:05"),
+		Level:   level,
+		Message: message,
+	}
+
+	g.logsLock.Lock()
+	g.logs = append(g.logs, entry)
+	if len(g.logs) > 200 {
+		g.logs = g.logs[len(g.logs)-200:]
+	}
+	g.logsLock.Unlock()
+
+	// 同时输出到控制台
+	levelIcon := "ℹ️"
+	switch level {
+	case "error":
+		levelIcon = "❌"
+	case "warn":
+		levelIcon = "⚠️"
+	case "debug":
+		levelIcon = "🔧"
+	}
+	fmt.Printf("[%s] %s %s\n", entry.Time, levelIcon, message)
+}
+
+// =====================================================
+// 工具函数
+// =====================================================
+
+func (g *WebGUI) FindAvailablePort(start int) int {
+	for port := start; port < start+100; port++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			ln.Close()
+			return port
+		}
+	}
+	return start
+}
+
+func openBrowser(url string) {
+	var err error
+	switch runtime.GOOS {
+	case "linux":
+		err = exec.Command("xdg-open", url).Start()
+	case "windows":
+		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		err = exec.Command("open", url).Start()
+	}
+	if err != nil {
+		fmt.Printf("⚠️ 无法自动打开浏览器，请手动访问: %s\n", url)
 	}
 }
+
+// =====================================================
+// HTML 界面
+// =====================================================
+
+func (g *WebGUI) serveIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(indexHTML))
+}
+
+const indexHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TLS-Client GUI v3.5 - 玩法A+B融合</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #0a0a1a 0%, #1a1a3a 50%, #0a1a2a 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+            line-height: 1.6;
+        }
+        
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        
+        /* 头部 */
+        header {
+            text-align: center;
+            padding: 40px 20px;
+            background: linear-gradient(135deg, rgba(0,212,255,0.1) 0%, rgba(155,89,182,0.1) 100%);
+            border-radius: 20px;
+            margin-bottom: 30px;
+            border: 1px solid rgba(0,212,255,0.2);
+        }
+        header h1 {
+            font-size: 2.8em;
+            background: linear-gradient(90deg, #00d4ff, #9b59b6, #00d4ff);
+            background-size: 200% auto;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: shine 3s linear infinite;
+            margin-bottom: 10px;
+        }
+        @keyframes shine {
+            to { background-position: 200% center; }
+        }
+        header p { color: #888; font-size: 1.1em; }
+        header .version {
+            display: inline-block;
+            background: linear-gradient(135deg, #00d4ff, #9b59b6);
+            color: white;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            margin-top: 10px;
+        }
+        
+        /* 标签导航 */
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 25px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .tab-btn {
+            padding: 14px 28px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            color: #aaa;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 15px;
+            font-weight: 500;
+        }
+        .tab-btn:hover {
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+            transform: translateY(-2px);
+        }
+        .tab-btn.active {
+            background: linear-gradient(135deg, #00d4ff, #9b59b6);
+            color: #fff;
+            border-color: transparent;
+            box-shadow: 0 8px 25px rgba(0,212,255,0.3);
+        }
+        
+        .tab-content { display: none; animation: fadeIn 0.3s ease; }
+        .tab-content.active { display: block; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        /* 卡片 */
+        .card {
+            background: rgba(255,255,255,0.03);
+            border-radius: 16px;
+            padding: 25px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(255,255,255,0.08);
+            backdrop-filter: blur(10px);
+        }
+        .card h3 {
+            color: #00d4ff;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .card h3::before {
+            content: '';
+            width: 4px;
+            height: 24px;
+            background: linear-gradient(135deg, #00d4ff, #9b59b6);
+            border-radius: 2px;
+        }
+        
+        /* 表单 */
+        .form-group {
+            margin-bottom: 18px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #999;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .form-group input, .form-group select, .form-group textarea {
+            width: 100%;
+            padding: 14px 16px;
+            background: rgba(0,0,0,0.4);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 10px;
+            color: #fff;
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+        .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+            outline: none;
+            border-color: #00d4ff;
+            box-shadow: 0 0 0 3px rgba(0,212,255,0.1);
+        }
+        .form-group input::placeholder { color: #555; }
+        
+        .form-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+        
+        /* 按钮 */
+        .btn {
+            padding: 14px 35px;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #00d4ff, #0095ff);
+            color: #fff;
+        }
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(0,212,255,0.4);
+        }
+        .btn-danger {
+            background: linear-gradient(135deg, #ff6b6b, #ee5a24);
+            color: #fff;
+        }
+        .btn-danger:hover:not(:disabled) {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(238,90,36,0.4);
+        }
+        .btn-success {
+            background: linear-gradient(135deg, #2ecc71, #27ae60);
+            color: #fff;
+        }
+        .btn-success:hover:not(:disabled) {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(46,204,113,0.4);
+        }
+        .btn-secondary {
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        /* 状态栏 */
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 18px 25px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 12px;
+            margin-bottom: 25px;
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+        .status-indicator {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: #ff6b6b;
+            box-shadow: 0 0 10px rgba(255,107,107,0.5);
+        }
+        .status-indicator.running {
+            background: #2ecc71;
+            box-shadow: 0 0 15px rgba(46,204,113,0.6);
+            animation: pulse 2s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.1); opacity: 0.8; }
+        }
+        .status-text { font-weight: 500; }
+        .status-text.running { color: #2ecc71; }
+        .status-text.stopped { color: #ff6b6b; }
+        
+        /* 结果框 */
+        .result-box {
+            background: rgba(0,0,0,0.5);
+            border-radius: 12px;
+            padding: 20px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 13px;
+            max-height: 450px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            border: 1px solid rgba(255,255,255,0.05);
+            line-height: 1.5;
+        }
+        .result-box::-webkit-scrollbar { width: 8px; }
+        .result-box::-webkit-scrollbar-track { background: rgba(0,0,0,0.3); border-radius: 4px; }
+        .result-box::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
+        
+        /* 指纹网格 */
+        .fingerprint-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+            max-height: 500px;
+            overflow-y: auto;
+            padding-right: 10px;
+        }
+        .fingerprint-card {
+            background: rgba(0,0,0,0.3);
+            border-radius: 12px;
+            padding: 18px;
+            border-left: 4px solid #00d4ff;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        .fingerprint-card:hover {
+            transform: translateX(5px);
+            background: rgba(0,0,0,0.4);
+        }
+        .fingerprint-card h4 {
+            color: #fff;
+            margin-bottom: 8px;
+            font-size: 1.05em;
+        }
+        .fingerprint-card .meta {
+            color: #888;
+            font-size: 12px;
+            display: flex;
+            gap: 15px;
+        }
+        .fingerprint-card.chrome { border-color: #4285f4; }
+        .fingerprint-card.firefox { border-color: #ff7139; }
+        .fingerprint-card.safari { border-color: #5ac8fa; }
+        .fingerprint-card.edge { border-color: #0078d7; }
+        
+        /* 日志框 */
+        .log-box {
+            background: rgba(0,0,0,0.5);
+            border-radius: 12px;
+            padding: 15px;
+            height: 400px;
+            overflow-y: auto;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+        .log-entry {
+            padding: 8px 12px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            display: flex;
+            gap: 12px;
+        }
+        .log-entry:last-child { border-bottom: none; }
+        .log-entry .time { color: #666; min-width: 70px; }
+        .log-entry .level {
+            min-width: 50px;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 11px;
+        }
+        .log-entry .level-info { color: #00d4ff; }
+        .log-entry .level-error { color: #ff6b6b; }
+        .log-entry .level-warn { color: #f39c12; }
+        .log-entry .level-debug { color: #9b59b6; }
+        .log-entry .message { color: #ccc; flex: 1; }
+        
+        /* 统计卡片 */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: linear-gradient(135deg, rgba(0,0,0,0.4) 0%, rgba(0,0,0,0.2) 100%);
+            border-radius: 16px;
+            padding: 25px;
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.05);
+            transition: transform 0.3s ease;
+        }
+        .stat-card:hover { transform: translateY(-5px); }
+        .stat-card .icon { font-size: 2em; margin-bottom: 10px; }
+        .stat-card .value {
+            font-size: 2.2em;
+            font-weight: 700;
+            background: linear-gradient(135deg, #00d4ff, #9b59b6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .stat-card .label { color: #888; margin-top: 8px; font-size: 14px; }
+        
+        /* 响应式 */
+        @media (max-width: 768px) {
+            header h1 { font-size: 2em; }
+            .tabs { gap: 8px; }
+            .tab-btn { padding: 12px 20px; font-size: 14px; }
+            .form-row { grid-template-columns: 1fr; }
+        }
+        
+        /* 加载动画 */
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* 提示框 */
+        .tooltip {
+            position: relative;
+        }
+        .tooltip:hover::after {
+            content: attr(data-tip);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.9);
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            white-space: nowrap;
+            z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛡️ TLS-Client GUI</h1>
+            <p>Anti-Fingerprint Network Engine | 反指纹网络引擎</p>
+            <span class="version">v3.5 完全体 - 玩法A+B融合</span>
+        </header>
+        
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="playA">🚀 玩法A: 隧道代理</button>
+            <button class="tab-btn" data-tab="playB">🔬 玩法B: 引擎直连</button>
+            <button class="tab-btn" data-tab="fingerprints">🎭 指纹库</button>
+            <button class="tab-btn" data-tab="status">📊 状态监控</button>
+            <button class="tab-btn" data-tab="logs">📝 运行日志</button>
+        </div>
+        
+        <!-- ==================== 玩法A: 隧道代理 ==================== -->
+        <div id="playA" class="tab-content active">
+            <div class="status-bar">
+                <div class="status-indicator" id="proxyIndicator"></div>
+                <span class="status-text stopped" id="proxyStatus">代理状态: 未运行</span>
+                <div style="flex:1"></div>
+                <span id="proxyProfile" style="color:#888;font-size:14px;"></span>
+            </div>
+            
+            <div class="card">
+                <h3>📡 节点配置</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>CF优选IP / 目标地址 *</label>
+                        <input type="text" id="cfAddress" value="172.67.170.151:443" placeholder="IP:端口 或 域名:端口">
+                    </div>
+                    <div class="form-group">
+                        <label>SNI (TLS服务器名称) *</label>
+                        <input type="text" id="sni" placeholder="your-worker.workers.dev">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>WebSocket 路径</label>
+                        <input type="text" id="wsPath" value="/" placeholder="/?token=xxx">
+                    </div>
+                    <div class="form-group">
+                        <label>SOCKS5 本地监听</label>
+                        <input type="text" id="socks5Listen" value="127.0.0.1:1080">
+                    </div>
+                    <div class="form-group">
+                        <label>HTTP 本地监听 (可选)</label>
+                        <input type="text" id="httpListen" placeholder="127.0.0.1:8080">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>🎭 指纹与传输配置</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>浏览器指纹</label>
+                        <select id="proxyProfile"></select>
+                    </div>
+                    <div class="form-group">
+                        <label>传输协议</label>
+                        <select id="transport">
+                            <option value="ws">WebSocket (推荐)</option>
+                            <option value="h2">HTTP/2 (实际为WS)</option>
+                            <option value="raw">Raw TLS</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>TLS 验证模式</label>
+                        <select id="verifyMode">
+                            <option value="sni-skip">SNI-Skip (域前置核心)</option>
+                            <option value="strict">严格验证</option>
+                            <option value="insecure">不验证 (仅测试)</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>🔗 Xlink 借力配置 (高级)</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>远程 SOCKS5 代理 (Worker出站)</label>
+                        <input type="text" id="xlinkSocks5" placeholder="user:pass@host:port">
+                    </div>
+                    <div class="form-group">
+                        <label>Fallback 地址 (备用跳板)</label>
+                        <input type="text" id="xlinkFallback" placeholder="host:port">
+                    </div>
+                </div>
+                <p style="color:#666;font-size:13px;margin-top:10px;">
+                    💡 Xlink 借力: 指挥 Worker 通过 SOCKS5 代理连接目标，或在直连失败时使用 Fallback 地址
+                </p>
+            </div>
+            
+            <div style="text-align:center;margin-top:25px;">
+                <button class="btn btn-primary" id="startProxyBtn" onclick="toggleProxy()">
+                    <span>▶</span> 启动代理
+                </button>
+            </div>
+        </div>
+        
+        <!-- ==================== 玩法B: 引擎直连 ==================== -->
+        <div id="playB" class="tab-content">
+            <div class="card">
+                <h3>🔬 发送伪装请求 (绕过WAF核心)</h3>
+                <div class="form-row">
+                    <div class="form-group" style="grid-column: 1 / -1;">
+                        <label>目标 URL *</label>
+                        <input type="text" id="targetUrl" value="https://tls.peet.ws/api/all" placeholder="https://example.com/api">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>请求方法</label>
+                        <select id="reqMethod">
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="DELETE">DELETE</option>
+                            <option value="HEAD">HEAD</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>浏览器指纹</label>
+                        <select id="reqProfile"></select>
+                    </div>
+                    <div class="form-group">
+                        <label>时序模式 (Cadence)</label>
+                        <select id="cadence">
+                            <option value="none">无延迟 (最快)</option>
+                            <option value="browsing">浏览模式 (1-5秒)</option>
+                            <option value="fast">快速模式 (100-500ms)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>超时时间 (秒)</label>
+                        <input type="number" id="reqTimeout" value="30" min="5" max="120">
+                    </div>
+                </div>
+                <div style="text-align:center;margin-top:20px;">
+                    <button class="btn btn-success" id="sendReqBtn" onclick="sendRequest()">
+                        <span>🚀</span> 发送请求
+                    </button>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>📋 响应结果</h3>
+                <div id="responseInfo" style="display:none;margin-bottom:15px;padding:15px;background:rgba(0,0,0,0.3);border-radius:10px;">
+                    <div style="display:flex;gap:30px;flex-wrap:wrap;">
+                        <div><strong>状态:</strong> <span id="respStatus" style="color:#2ecc71">-</span></div>
+                        <div><strong>耗时:</strong> <span id="respTime">-</span></div>
+                        <div><strong>大小:</strong> <span id="respSize">-</span></div>
+                        <div><strong>指纹:</strong> <span id="respProfile" style="color:#00d4ff">-</span></div>
+                    </div>
+                </div>
+                <div class="result-box" id="responseResult">等待发送请求...</div>
+            </div>
+        </div>
+        
+        <!-- ==================== 指纹库 ==================== -->
+        <div id="fingerprints" class="tab-content">
+            <div class="card">
+                <h3>🎭 可用指纹库 (<span id="fpCount">0</span> 个)</h3>
+                <div style="margin-bottom:20px;">
+                    <input type="text" id="fpSearch" placeholder="搜索指纹名称、浏览器、平台..."
+                           style="width:100%;max-width:400px;" oninput="filterFingerprints()">
+                </div>
+                <div class="fingerprint-grid" id="fingerprintList"></div>
+            </div>
+            
+            <div class="card" id="fpDetail" style="display:none;">
+                <h3>📋 指纹详情</h3>
+                <pre id="fpDetailContent" class="result-box"></pre>
+            </div>
+        </div>
+        
+        <!-- ==================== 状态监控 ==================== -->
+        <div id="status" class="tab-content">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="icon">🔗</div>
+                    <div class="value" id="statConns">0</div>
+                    <div class="label">总连接数</div>
+                </div>
+                <div class="stat-card">
+                    <div class="icon">⚡</div>
+                    <div class="value" id="statActive">0</div>
+                    <div class="label">活跃连接</div>
+                </div>
+                <div class="stat-card">
+                    <div class="icon">⏱️</div>
+                    <div class="value" id="statUptime">0s</div>
+                    <div class="label">运行时间</div>
+                </div>
+                <div class="stat-card">
+                    <div class="icon">🎭</div>
+                    <div class="value" id="statFingerprints">0</div>
+                    <div class="label">指纹数量</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>📊 指纹分布统计</h3>
+                <div style="display:flex;gap:40px;flex-wrap:wrap;">
+                    <div>
+                        <h4 style="color:#888;margin-bottom:10px;">按浏览器</h4>
+                        <div id="browserStats"></div>
+                    </div>
+                    <div>
+                        <h4 style="color:#888;margin-bottom:10px;">按平台</h4>
+                        <div id="platformStats"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- ==================== 运行日志 ==================== -->
+        <div id="logs" class="tab-content">
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                    <h3 style="margin-bottom:0;">📝 运行日志</h3>
+                    <button class="btn btn-secondary" onclick="clearLogs()">🗑️ 清空</button>
+                </div>
+                <div class="log-box" id="logBox"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // ==================== 全局变量 ====================
+        let proxyRunning = false;
+        let allFingerprints = [];
+        
+        // ==================== 初始化 ====================
+        document.addEventListener('DOMContentLoaded', () => {
+            initTabs();
+            loadFingerprints();
+            startPolling();
+        });
+        
+        function initTabs() {
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                    btn.classList.add('active');
+                    document.getElementById(btn.dataset.tab).classList.add('active');
+                });
+            });
+        }
+        
+        // ==================== 指纹管理 ====================
+        async function loadFingerprints() {
+            try {
+                const resp = await fetch('/api/fingerprints');
+                const data = await resp.json();
+                
+                if (!data.success) return;
+                
+                allFingerprints = data.profiles;
+                
+                // 填充下拉框
+                ['proxyProfile', 'reqProfile'].forEach(id => {
+                    const select = document.getElementById(id);
+                    select.innerHTML = '';
+                    data.profiles.forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p.name;
+                        opt.textContent = ` + "`${p.name} (${p.browser}/${p.platform})`" + `;
+                        if (p.name === data.default) opt.selected = true;
+                        select.appendChild(opt);
+                    });
+                });
+                
+                renderFingerprints(data.profiles);
+                document.getElementById('fpCount').textContent = data.count;
+                document.getElementById('statFingerprints').textContent = data.count;
+                
+                // 统计信息
+                renderStats(data.browsers, 'browserStats', {chrome:'#4285f4',firefox:'#ff7139',safari:'#5ac8fa',edge:'#0078d7'});
+                renderStats(data.platforms, 'platformStats', {windows:'#0078d7',macos:'#555',linux:'#f39c12',ios:'#5ac8fa',android:'#3ddc84'});
+                
+            } catch (e) {
+                console.error('加载指纹失败:', e);
+            }
+        }
+        
+        function renderFingerprints(profiles) {
+            const grid = document.getElementById('fingerprintList');
+            grid.innerHTML = profiles.map(p => ` + "`" + `
+                <div class="fingerprint-card ${p.browser}" onclick="showFpDetail('${p.name}')">
+                    <h4>${p.name}</h4>
+                    <div class="meta">
+                        <span>🌐 ${p.browser}</span>
+                        <span>💻 ${p.platform}</span>
+                        <span>📌 v${p.version}</span>
+                    </div>
+                </div>
+            ` + "`" + `).join('');
+        }
+        
+        function filterFingerprints() {
+            const q = document.getElementById('fpSearch').value.toLowerCase();
+            const filtered = allFingerprints.filter(p => 
+                p.name.toLowerCase().includes(q) ||
+                p.browser.toLowerCase().includes(q) ||
+                p.platform.toLowerCase().includes(q)
+            );
+            renderFingerprints(filtered);
+        }
+        
+        function showFpDetail(name) {
+            const p = allFingerprints.find(f => f.name === name);
+            if (!p) return;
+            
+            document.getElementById('fpDetail').style.display = 'block';
+            document.getElementById('fpDetailContent').textContent = JSON.stringify(p, null, 2);
+        }
+        
+        function renderStats(stats, elemId, colors) {
+            const elem = document.getElementById(elemId);
+            elem.innerHTML = Object.entries(stats).map(([k,v]) => ` + "`" + `
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                    <span style="width:12px;height:12px;border-radius:3px;background:${colors[k]||'#666'}"></span>
+                    <span style="min-width:80px;">${k}</span>
+                    <span style="color:#00d4ff;font-weight:600;">${v}</span>
+                </div>
+            ` + "`" + `).join('');
+        }
+        
+        // ==================== 代理控制 ====================
+        async function toggleProxy() {
+            const btn = document.getElementById('startProxyBtn');
+            btn.disabled = true;
+            
+            try {
+                if (proxyRunning) {
+                    const resp = await fetch('/api/proxy/stop', { method: 'POST' });
+                    const data = await resp.json();
+                    if (data.success) {
+                        setProxyState(false);
+                    } else {
+                        alert('停止失败: ' + data.error);
+                    }
+                } else {
+                    const config = {
+                        address: document.getElementById('cfAddress').value,
+                        sni: document.getElementById('sni').value,
+                        ws_path: document.getElementById('wsPath').value,
+                        listen: document.getElementById('socks5Listen').value,
+                        http_listen: document.getElementById('httpListen').value,
+                        profile: document.getElementById('proxyProfile').value,
+                        transport: document.getElementById('transport').value,
+                        verify_mode: document.getElementById('verifyMode').value,
+                        socks5_proxy: document.getElementById('xlinkSocks5').value,
+                        fallback: document.getElementById('xlinkFallback').value
+                    };
+                    
+                    const resp = await fetch('/api/proxy/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(config)
+                    });
+                    const data = await resp.json();
+                    
+                    if (data.success) {
+                        setProxyState(true, config);
+                    } else {
+                        alert('启动失败: ' + data.error);
+                    }
+                }
+            } catch (e) {
+                alert('操作失败: ' + e.message);
+            }
+            
+            btn.disabled = false;
+        }
+        
+        function setProxyState(running, config) {
+            proxyRunning = running;
+            const btn = document.getElementById('startProxyBtn');
+            const indicator = document.getElementById('proxyIndicator');
+            const status = document.getElementById('proxyStatus');
+            const profile = document.getElementById('proxyProfile');
+            
+            if (running) {
+                btn.innerHTML = '<span>⏹</span> 停止代理';
+                btn.className = 'btn btn-danger';
+                indicator.classList.add('running');
+                status.textContent = '代理状态: 运行中 (' + config.listen + ')';
+                status.className = 'status-text running';
+                profile.textContent = '指纹: ' + config.profile;
+            } else {
+                btn.innerHTML = '<span>▶</span> 启动代理';
+                btn.className = 'btn btn-primary';
+                indicator.classList.remove('running');
+                status.textContent = '代理状态: 未运行';
+                status.className = 'status-text stopped';
+                profile.textContent = '';
+            }
+        }
+        
+        // ==================== 玩法B请求 ====================
+        async function sendRequest() {
+            const btn = document.getElementById('sendReqBtn');
+            const resultBox = document.getElementById('responseResult');
+            const infoBox = document.getElementById('responseInfo');
+            
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span> 请求中...';
+            resultBox.textContent = '正在发送请求...';
+            infoBox.style.display = 'none';
+            
+            try {
+                const config = {
+                    url: document.getElementById('targetUrl').value,
+                    method: document.getElementById('reqMethod').value,
+                    profile: document.getElementById('reqProfile').value,
+                    cadence: document.getElementById('cadence').value,
+                    timeout: parseInt(document.getElementById('reqTimeout').value) || 30
+                };
+                
+                const resp = await fetch('/api/request', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                const data = await resp.json();
+                
+                if (data.success) {
+                    infoBox.style.display = 'block';
+                    document.getElementById('respStatus').textContent = data.status;
+                    document.getElementById('respStatus').style.color = data.status_code < 400 ? '#2ecc71' : '#ff6b6b';
+                    document.getElementById('respTime').textContent = data.elapsed_ms + 'ms';
+                    document.getElementById('respSize').textContent = formatBytes(data.body_size);
+                    document.getElementById('respProfile').textContent = data.profile + ' (' + data.profile_info.browser + ')';
+                    
+                    // 尝试格式化JSON
+                    let body = data.body;
+                    try {
+                        body = JSON.stringify(JSON.parse(data.body), null, 2);
+                    } catch {}
+                    resultBox.textContent = body;
+                } else {
+                    resultBox.textContent = '❌ 请求失败: ' + data.error + '\\n\\n耗时: ' + (data.elapsed_ms || 0) + 'ms';
+                }
+            } catch (e) {
+                resultBox.textContent = '❌ 请求异常: ' + e.message;
+            }
+            
+            btn.disabled = false;
+            btn.innerHTML = '<span>🚀</span> 发送请求';
+        }
+        
+        // ==================== 日志 ====================
+        async function updateLogs() {
+            try {
+                const resp = await fetch('/api/logs');
+                const data = await resp.json();
+                if (!data.success) return;
+                
+                const box = document.getElementById('logBox');
+                const wasAtBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 50;
+                
+                box.innerHTML = data.logs.map(log => ` + "`" + `
+                    <div class="log-entry">
+                        <span class="time">${log.time}</span>
+                        <span class="level level-${log.level}">${log.level}</span>
+                        <span class="message">${escapeHtml(log.message)}</span>
+                    </div>
+                ` + "`" + `).join('');
+                
+                if (wasAtBottom) box.scrollTop = box.scrollHeight;
+            } catch {}
+        }
+        
+        async function clearLogs() {
+            await fetch('/api/logs/clear', { method: 'POST' });
+            updateLogs();
+        }
+        
+        // ==================== 统计 ====================
+        async function updateStats() {
+            try {
+                const resp = await fetch('/api/stats');
+                const data = await resp.json();
+                if (!data.success) return;
+                
+                document.getElementById('statConns').textContent = data.total_conns;
+                document.getElementById('statActive').textContent = data.active_conns;
+                document.getElementById('statUptime').textContent = formatUptime(data.uptime_secs);
+                
+                // 同步代理状态
+                if (data.running !== proxyRunning) {
+                    if (data.running) {
+                        // 恢复代理状态显示
+                        const statusResp = await fetch('/api/proxy/status');
+                        const statusData = await statusResp.json();
+                        if (statusData.running && statusData.config) {
+                            setProxyState(true, statusData.config);
+                        }
+                    } else {
+                        setProxyState(false);
+                    }
+                }
+            } catch {}
+        }
+        
+        // ==================== 轮询 ====================
+        function startPolling() {
+            updateLogs();
+            updateStats();
+            setInterval(updateLogs, 2000);
+            setInterval(updateStats, 1000);
+        }
+        
+        // ==================== 工具函数 ====================
+        function formatBytes(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+            return (bytes/1024/1024).toFixed(2) + ' MB';
+        }
+        
+        function formatUptime(secs) {
+            if (secs < 60) return secs + 's';
+            if (secs < 3600) return Math.floor(secs/60) + 'm ' + (secs%60) + 's';
+            return Math.floor(secs/3600) + 'h ' + Math.floor((secs%3600)/60) + 'm';
+        }
+        
+        function escapeHtml(str) {
+            return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+    </script>
+</body>
+</html>`

@@ -8,34 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # 第一步：生成并缓存依赖
-  prepare:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.21.x"
-
-      - name: Generate go.sum
-        run: |
-          go mod download
-          go mod tidy
-          cat go.sum
-
-      - name: Upload go.sum
-        uses: actions/upload-artifact@v4
-        with:
-          name: go-sum
-          path: go.sum
-          retention-days: 1
-
-  # 第二步：构建各平台
   build-gui:
-    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -44,15 +17,15 @@ jobs:
             goos: linux
             goarch: amd64
             ext: ""
-          - os: windows-latest
+          - os: ubuntu-latest
             goos: windows
             goarch: amd64
             ext: ".exe"
-          - os: macos-latest
+          - os: ubuntu-latest
             goos: darwin
             goarch: amd64
             ext: ""
-          - os: macos-latest
+          - os: ubuntu-latest
             goos: darwin
             goarch: arm64
             ext: ""
@@ -63,86 +36,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download go.sum
-        uses: actions/download-artifact@v4
-        with:
-          name: go-sum
-          path: .
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.21.x"
-          cache: true
 
-      # Linux 依赖
-      - name: Install Linux dependencies
-        if: matrix.goos == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgl1-mesa-dev \
-            libxcursor-dev \
-            libxrandr-dev \
-            libxinerama-dev \
-            libxi-dev \
-            libxxf86vm-dev \
-            libx11-dev \
-            pkg-config
-
-      # 下载Go依赖
       - name: Download dependencies
         run: |
           go mod download
-          go mod verify
-        shell: bash
+          go mod tidy
 
-      # 构建 - Linux
-      - name: Build (Linux)
-        if: matrix.goos == 'linux'
+      - name: Build GUI
         env:
-          CGO_ENABLED: "1"
-          GOOS: linux
-          GOARCH: amd64
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o dist/tls-client-gui-linux-amd64 ./cmd/gui/
+          go build -trimpath -ldflags="-s -w" -o dist/tls-client-gui-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/gui/
 
-      # 构建 - macOS amd64
-      - name: Build (macOS amd64)
-        if: matrix.goos == 'darwin' && matrix.goarch == 'amd64'
-        env:
-          CGO_ENABLED: "1"
-          GOOS: darwin
-          GOARCH: amd64
-        run: |
-          mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o dist/tls-client-gui-darwin-amd64 ./cmd/gui/
-
-      # 构建 - macOS arm64
-      - name: Build (macOS arm64)
-        if: matrix.goos == 'darwin' && matrix.goarch == 'arm64'
-        env:
-          CGO_ENABLED: "1"
-          GOOS: darwin
-          GOARCH: arm64
-        run: |
-          mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o dist/tls-client-gui-darwin-arm64 ./cmd/gui/
-
-      # 构建 - Windows
-      - name: Build (Windows)
-        if: matrix.goos == 'windows'
-        shell: bash
-        env:
-          CGO_ENABLED: "1"
-          GOOS: windows
-          GOARCH: amd64
-        run: |
-          mkdir -p dist
-          go build -trimpath -ldflags="-s -w -H windowsgui" -o dist/tls-client-gui-windows-amd64.exe ./cmd/gui/
-
-      # 上传产物
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

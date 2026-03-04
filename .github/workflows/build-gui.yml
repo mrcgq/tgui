@@ -13,50 +13,45 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            goos: linux
+          - goos: linux
             goarch: amd64
             ext: ""
-          - os: ubuntu-latest
-            goos: windows
+          - goos: windows
             goarch: amd64
             ext: ".exe"
-          - os: ubuntu-latest
-            goos: darwin
+          - goos: darwin
             goarch: amd64
             ext: ""
-          - os: ubuntu-latest
-            goos: darwin
+          - goos: darwin
             goarch: arm64
             ext: ""
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: "1.21.x"
 
-      - name: Download dependencies
+      - name: Tidy and download deps
         run: |
-          go mod download
           go mod tidy
+          go mod download
 
-      - name: Build GUI
+      - name: Build
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o dist/tls-client-gui-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/gui/
+          go build -trimpath -ldflags="-s -w" \
+            -o dist/tls-client-gui-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} \
+            ./cmd/gui/
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: tls-client-gui-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/tls-client-gui-*
